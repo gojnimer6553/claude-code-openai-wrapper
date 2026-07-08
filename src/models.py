@@ -1,39 +1,74 @@
 from typing import List, Optional, Dict, Any, Union, Literal
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from datetime import datetime
 import uuid
+import json
 import logging
 
 logger = logging.getLogger(__name__)
 
 
-# Resolve the default model lazily (avoids circular imports). If the operator
-# set DEFAULT_MODEL via env var, honor it; otherwise prefer the live-resolved
-# latest Sonnet (set at startup by main.resolve_default_model), falling back
-# to the static constant when resolution hasn't happened yet.
+# Import DEFAULT_MODEL to avoid circular imports
 def get_default_model():
-    from src import constants
+    """Get default model from constants to avoid circular imports."""
+    from src.constants import DEFAULT_MODEL
 
-    if constants.DEFAULT_MODEL_ENV:
-        return constants.DEFAULT_MODEL_ENV
-    return constants.RESOLVED_DEFAULT_MODEL or constants.DEFAULT_MODEL_FALLBACK
+    return DEFAULT_MODEL
 
 
 class ContentPart(BaseModel):
     """Content part for multimodal messages (OpenAI format)."""
+    model_config = ConfigDict(extra="ignore")
 
     type: Literal["text"]
     text: str
 
 
 class Message(BaseModel):
-    role: Literal["system", "user", "assistant"]
-    content: Union[str, List[ContentPart]]
+    model_config = ConfigDict(extra="ignore")
+
+    role: Literal["system", "user", "assistant", "developer", "tool"]
+    content: Optional[Union[str, List[ContentPart]]] = None
     name: Optional[str] = None
+    tool_calls: Optional[List[Any]] = Field(
+        default=None,
+        description="Tool calls made by the assistant (OpenAI format)",
+    )
+    tool_call_id: Optional[str] = Field(
+        default=None,
+        description="Tool call ID this message is responding to (for role=tool)",
+    )
 
     @model_validator(mode="after")
     def normalize_content(self):
         """Convert array content to string for Claude Code compatibility."""
+        # Treat 'developer' role as 'system' for Claude compatibility
+        if self.role == "developer":
+            self.role = "system"
+        # Treat 'tool' role as 'user' for Claude compatibility.
+        # Wrap in <tool_result> XML so Claude correlates the result with the
+        # prior <tool_call> it emitted and uses the data in its answer.
+        if self.role == "tool":
+            tool_id = self.tool_call_id or ""
+            tool_name = self.name or ""
+            result_content = self.content if self.content is not None else ""
+            if isinstance(result_content, list):
+                # flatten list content parts first
+                parts = []
+                for part in result_content:
+                    if isinstance(part, dict) and part.get("type") == "text":
+                        parts.append(part.get("text", ""))
+                result_content = "\n".join(parts)
+            self.role = "user"
+            self.content = (
+                f"<tool_result>\n"
+                f'{{"id": "{tool_id}", "name": "{tool_name}", '
+                f'"result": {json.dumps(result_content)}}}\n'
+                f"</tool_result>"
+            )
+        # Handle null content (e.g. assistant messages with tool_calls)
+        if self.content is None:
+            self.content = ""
         if isinstance(self.content, list):
             # Extract text from content parts and concatenate
             text_parts = []
@@ -58,6 +93,8 @@ class StreamOptions(BaseModel):
 
 
 class ChatCompletionRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
     model: str = Field(default_factory=get_default_model)
     messages: List[Message]
     temperature: Optional[float] = Field(default=1.0, ge=0, le=2)
@@ -79,6 +116,14 @@ class ChatCompletionRequest(BaseModel):
     enable_tools: Optional[bool] = Field(
         default=False,
         description="Enable Claude Code tools (Read, Write, Bash, etc.) - disabled by default for OpenAI compatibility",
+    )
+    tools: Optional[List[Dict[str, Any]]] = Field(
+        default=None,
+        description="OpenAI-format tool definitions. When present, enables passthrough mode with full tool access.",
+    )
+    tool_choice: Optional[Any] = Field(
+        default=None,
+        description="Tool choice preference (auto, none, or specific tool)",
     )
     stream_options: Optional[StreamOptions] = Field(
         default=None, description="Options for streaming responses"
@@ -203,10 +248,23 @@ class ChatCompletionRequest(BaseModel):
         return options
 
 
+class FunctionCall(BaseModel):
+    """OpenAI function call format within a tool call."""
+    name: str
+    arguments: str  # JSON-encoded arguments
+
+
+class ToolCall(BaseModel):
+    """OpenAI tool call format."""
+    id: str
+    type: Literal["function"] = "function"
+    function: FunctionCall
+
+
 class Choice(BaseModel):
     index: int
     message: Message
-    finish_reason: Optional[Literal["stop", "length", "content_filter", "null"]] = None
+    finish_reason: Optional[Literal["stop", "length", "content_filter", "tool_calls", "null"]] = None
 
 
 class Usage(BaseModel):
@@ -228,7 +286,7 @@ class ChatCompletionResponse(BaseModel):
 class StreamChoice(BaseModel):
     index: int
     delta: Dict[str, Any]
-    finish_reason: Optional[Literal["stop", "length", "content_filter", "null"]] = None
+    finish_reason: Optional[Literal["stop", "length", "content_filter", "tool_calls", "null"]] = None
 
 
 class ChatCompletionStreamResponse(BaseModel):

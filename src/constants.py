@@ -59,6 +59,21 @@ DEFAULT_ALLOWED_TOOLS = [
     "Edit",
 ]
 
+# Tools to allow in passthrough mode (agent frameworks like OpenClaw)
+# Broader set including network tools needed for agent functionality
+PASSTHROUGH_ALLOWED_TOOLS = [
+    "Read",
+    "Glob",
+    "Grep",
+    "Bash",
+    "Write",
+    "Edit",
+    "WebFetch",
+    "WebSearch",
+    "NotebookEdit",
+    "Task",
+]
+
 # Tools to disallow by default (potentially dangerous or slow)
 DEFAULT_DISALLOWED_TOOLS = [
     "Task",  # Can spawn sub-agents
